@@ -153,12 +153,14 @@ fun WebViewScreenContent(
                      if (isAdBlockEnabled && isAdRequest(request.url.host)) {
                          return WebResourceResponse(
                              "text/plain",
-                             "UTF-8",
-                             ByteArrayInputStream(ByteArray(0)),
+                            "UTF-8",
+                            ByteArrayInputStream(ByteArray(0)),
                          )
                      }
                      return super.shouldInterceptRequest(view, request)
                  }
+
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 url?.let {
                     currentUrl = it
