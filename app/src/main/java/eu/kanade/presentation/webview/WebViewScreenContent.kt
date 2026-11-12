@@ -1,5 +1,7 @@
 package eu.kanade.presentation.webview
 
+import android.webkit.WebResourceResponse
+import java.io.ByteArrayInputStream
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Message
@@ -103,6 +105,35 @@ fun WebViewScreenContent(
 
     var currentUrl by remember { mutableStateOf(url) }
     var showCloudflareHelp by remember { mutableStateOf(false) }
+        var isAdBlockEnabled by remember { mutableStateOf(true) }
+    val adBlockHosts = remember {
+        setOf(
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "adservice.google.com",
+            "google-analytics.com",
+            "googletagmanager.com",
+            "googletagservices.com",
+            "static.cloudflareinsights.com",
+            "adsterra.com",
+            "a-ads.com",
+            "popads.net",
+            "propellerads.com",
+            "exoclick.com",
+            "juicyads.com",
+            "hilltopads.net",
+            "adnxs.com",
+            "taboola.com",
+            "outbrain.com",
+            "histats.com",
+        )
+    }
+
+    fun isAdRequest(host: String?): Boolean {
+        if (host == null) return false
+        return adBlockHosts.any { host == it || host.endsWith(".$it") }
+    }
     var isActive by remember { mutableStateOf(true) }
 
     DisposableEffect(Unit) {
@@ -113,7 +144,21 @@ fun WebViewScreenContent(
 
     val webClient = remember {
         object : AccompanistWebViewClient() {
+            
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                 override fun shouldInterceptRequest(
+                     view: WebView,
+                     request: WebResourceRequest,
+                 ): WebResourceResponse? {
+                     if (isAdBlockEnabled && isAdRequest(request.url.host)) {
+                         return WebResourceResponse(
+                             "text/plain",
+                             "UTF-8",
+                             ByteArrayInputStream(ByteArray(0)),
+                         )
+                     }
+                     return super.shouldInterceptRequest(view, request)
+                 }
                 super.onPageStarted(view, url, favicon)
                 url?.let {
                     currentUrl = it
@@ -291,6 +336,13 @@ fun WebViewScreenContent(
                                     AppBar.OverflowAction(
                                         title = stringResource(MR.strings.pref_clear_cookies),
                                         onClick = { onClearCookies(currentUrl) },
+                                    ),
+                                    AppBar.OverflowAction(
+                                        title = if (isAdBlockEnabled) "Desactivar bloqueo de anuncios" else "Activar bloqueo de anuncios",
+                                        onClick = {
+                                            isAdBlockEnabled = !isAdBlockEnabled
+                                            navigator.reload()
+                                        },
                                     ),
                                 ).toMutableList().apply {
                                     if (windowStack.size > 1) {
