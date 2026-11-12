@@ -24,10 +24,10 @@ jobs:
           mkdir -p ~/.android
           echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ~/.android/debug.keystore
 
-      - name: Build APK
+      - name: List tasks
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleStandardDebug --no-daemon
+          ./gradlew :app:tasks --all --no-daemon | grep -i assemble
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
