@@ -1,7 +1,5 @@
 package eu.kanade.presentation.webview
 
-import android.webkit.WebResourceResponse
-import java.io.ByteArrayInputStream
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Message
@@ -9,6 +7,7 @@ import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -51,6 +50,7 @@ import eu.kanade.tachiyomi.util.system.getHtml
 import eu.kanade.tachiyomi.util.system.setDefaultSettings
 import eu.kanade.tachiyomi.util.system.setUserAgent
 import eu.kanade.tachiyomi.util.system.toast
+import java.io.ByteArrayInputStream
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import mihon.icons.materialsymbols.MaterialSymbols
@@ -105,7 +105,7 @@ fun WebViewScreenContent(
 
     var currentUrl by remember { mutableStateOf(url) }
     var showCloudflareHelp by remember { mutableStateOf(false) }
-        var isAdBlockEnabled by remember { mutableStateOf(true) }
+    var isAdBlockEnabled by remember { mutableStateOf(true) }
     val adBlockHosts = remember {
         setOf(
             "doubleclick.net",
@@ -144,21 +144,20 @@ fun WebViewScreenContent(
 
     val webClient = remember {
         object : AccompanistWebViewClient() {
-            
-            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                 override fun shouldInterceptRequest(
-                     view: WebView,
-                     request: WebResourceRequest,
-                 ): WebResourceResponse? {
-                     if (isAdBlockEnabled && isAdRequest(request.url.host)) {
-                         return WebResourceResponse(
-                             "text/plain",
-                            "UTF-8",
-                            ByteArrayInputStream(ByteArray(0)),
-                         )
-                     }
-                     return super.shouldInterceptRequest(view, request)
-                 }
+
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest,
+            ): WebResourceResponse? {
+                if (isAdBlockEnabled && isAdRequest(request.url.host)) {
+                    return WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        ByteArrayInputStream(ByteArray(0)),
+                    )
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
