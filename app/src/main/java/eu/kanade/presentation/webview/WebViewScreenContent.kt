@@ -63,6 +63,37 @@ import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 
+private const val ANTI_ADBLOCK_NAG_SWEEPER = """
+(function() {
+    if (window.__mihonAdblockSweeperStarted) return;
+    window.__mihonAdblockSweeperStarted = true;
+    function sweep() {
+        try {
+            var sel = '[id*="adblock" i],[class*="adblock" i],[id*="ad-block" i],[class*="ad-block" i],[id*="detect-ad" i],[class*="detect-ad" i]';
+            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
+            document.querySelectorAll('div,section').forEach(function(el) {
+                var t = el.textContent || '';
+                if (t.indexOf('Bloqueador de anuncios detectado') !== -1 && el.children.length < 15) {
+                    el.remove();
+                }
+            });
+            [document.documentElement, document.body].forEach(function(el) {
+                if (!el) return;
+                el.style.overflow = '';
+                if (el.style.position === 'fixed') el.style.position = '';
+            });
+        } catch (e) {}
+    }
+    sweep();
+    var count = 0;
+    var id = setInterval(function() {
+        sweep();
+        count++;
+        if (count > 40) clearInterval(id);
+    }, 500);
+})();
+"""
+
 class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
     var state by mutableStateOf(WebViewState(webContent))
     var popupMessage: Message? = null
@@ -169,6 +200,9 @@ fun WebViewScreenContent(
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
+                if (isAdBlockEnabled) {
+                    view.evaluateJavascript(ANTI_ADBLOCK_NAG_SWEEPER, null)
+                }
                 scope.launch {
                     val html = view.getHtml()
                     showCloudflareHelp = "window._cf_chl_opt" in html || "Ray ID is" in html
