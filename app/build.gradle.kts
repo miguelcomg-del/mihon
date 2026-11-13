@@ -72,6 +72,9 @@ android {
         val debug = getByName("debug") {
             applicationIdSuffix = ".dev"
             isPseudoLocalesEnabled = true
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles("proguard-android-optimize.txt", "proguard-rules.pro")
         }
         val release = getByName("release") {
             isMinifyEnabled = true
