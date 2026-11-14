@@ -71,12 +71,20 @@ private const val ANTI_ADBLOCK_NAG_SWEEPER = """
         try {
             var sel = '[id*="adblock" i],[class*="adblock" i],[id*="ad-block" i],[class*="ad-block" i],[id*="detect-ad" i],[class*="detect-ad" i]';
             document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
-            document.querySelectorAll('div,section').forEach(function(el) {
-                var t = el.textContent || '';
-                if (t.indexOf('Bloqueador de anuncios detectado') !== -1 && el.children.length < 15) {
-                    el.remove();
-                }
+
+            var phrase = 'Bloqueador de anuncios detectado';
+            var candidates = Array.prototype.filter.call(
+                document.querySelectorAll('div,section'),
+                function(el) { return (el.textContent || '').indexOf(phrase) !== -1; },
+            );
+            var innermost = candidates.filter(function(el) {
+                return !candidates.some(function(other) { return other !== el && el.contains(other); });
             });
+            innermost.forEach(function(el) {
+                var textLen = (el.textContent || '').length;
+                if (textLen < 3000) { el.remove(); }
+            });
+
             [document.documentElement, document.body].forEach(function(el) {
                 if (!el) return;
                 el.style.overflow = '';
