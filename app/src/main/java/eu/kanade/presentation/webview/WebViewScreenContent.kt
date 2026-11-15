@@ -1,5 +1,6 @@
 package eu.kanade.presentation.webview
 
+import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Message
@@ -51,6 +52,12 @@ import eu.kanade.tachiyomi.util.system.setDefaultSettings
 import eu.kanade.tachiyomi.util.system.setUserAgent
 import eu.kanade.tachiyomi.util.system.toast
 import java.io.ByteArrayInputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import mihon.icons.materialsymbols.MaterialSymbols
@@ -63,44 +70,105 @@ import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 
-private const val ANTI_ADBLOCK_NAG_SWEEPER = """
-(function() {
-    if (window.__mihonAdblockSweeperStarted) return;
-    window.__mihonAdblockSweeperStarted = true;
-    function sweep() {
-        try {
-            var sel = '[id*="adblock" i],[class*="adblock" i],[id*="ad-block" i],[class*="ad-block" i],[id*="detect-ad" i],[class*="detect-ad" i]';
-            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
+// Lista pública de dominios de publicidad (misma filosofía que AdAway).
+// Se descarga una vez y se cachea 7 días; si falla la descarga, no bloquea nada extra
+// (la lista corta de abajo sigue funcionando igual).
+private object AdBlockHostList {
+    @Volatile private var hosts: Set<String>? = null
+    @Volatile private var loading = false
 
-            var phrase = 'Bloqueador de anuncios detectado';
-            var candidates = Array.prototype.filter.call(
-                document.querySelectorAll('div,section'),
-                function(el) { return (el.textContent || '').indexOf(phrase) !== -1; },
-            );
-            var innermost = candidates.filter(function(el) {
-                return !candidates.some(function(other) { return other !== el && el.contains(other); });
-            });
-            innermost.forEach(function(el) {
-                var textLen = (el.textContent || '').length;
-                if (textLen < 3000) { el.remove(); }
-            });
+    private const val REMOTE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    private const val CACHE_FILE_NAME = "mihon_adblock_hosts.txt"
+    private const val MAX_AGE_MILLIS = 7L * 24 * 60 * 60 * 1000
 
-            [document.documentElement, document.body].forEach(function(el) {
-                if (!el) return;
-                el.style.overflow = '';
-                if (el.style.position === 'fixed') el.style.position = '';
-            });
-        } catch (e) {}
+    fun isBlocked(host: String?): Boolean {
+        val set = hosts ?: return false
+        if (host.isNullOrEmpty()) return false
+        var current = host
+        while (true) {
+            if (set.contains(current)) return true
+            val dot = current.indexOf('.')
+            if (dot < 0) return false
+            current = current.substring(dot + 1)
+        }
     }
-    sweep();
-    var count = 0;
-    var id = setInterval(function() {
-        sweep();
-        count++;
-        if (count > 40) clearInterval(id);
-    }, 500);
-})();
-"""
+
+    fun ensureLoaded(context: Context) {
+        if (hosts != null || loading) return
+        loading = true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val cacheFile = File(context.filesDir, CACHE_FILE_NAME)
+                val isFresh = cacheFile.exists() &&
+                    (System.currentTimeMillis() - cacheFile.lastModified() < MAX_AGE_MILLIS)
+
+                val text = if (isFresh) {
+                    cacheFile.readText()
+                } else {
+                    val downloaded = runCatching { download(REMOTE_URL) }.getOrNull()
+                    when {
+                        downloaded != null -> {
+                            runCatching { cacheFile.writeText(downloaded) }
+                            downloaded
+                        }
+                        cacheFile.exists() -> cacheFile.readText()
+                        else -> null
+                    }
+                }
+
+                if (text != null) {
+                    hosts = parse(text)
+                }
+            } catch (e: Exception) {
+                logcat(LogPriority.ERROR, e) { "AdBlockHostList: fallo al cargar la lista" }
+            } finally {
+                loading = false
+            }
+        }
+    }
+
+    private fun download(urlStr: String): String {
+        val connection = URL(urlStr).openConnection() as HttpURLConnection
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 15_000
+        return connection.inputStream.use { it.bufferedReader().readText() }
+    }
+
+    private fun parse(text: String): Set<String> {
+        val set = HashSet<String>(200_000)
+        for (rawLine in text.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val parts = line.split(Regex("\\s+"))
+            if (parts.size < 2) continue
+            if (parts[0] != "0.0.0.0" && parts[0] != "127.0.0.1") continue
+            val domain = parts[1].lowercase()
+            if (domain == "localhost" || domain == "localhost.localdomain" ||
+                domain == "local" || domain == "broadcasthost"
+            ) {
+                continue
+            }
+            set.add(domain)
+        }
+        return set
+    }
+}
+
+// Lista corta y segura: dominios de anuncios directos que nunca gatillan revelar contenido.
+private val SAFE_AD_HOSTS = setOf(
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "adsterra.com",
+    "a-ads.com",
+    "popads.net",
+    "propellerads.com",
+    "exoclick.com",
+    "juicyads.com",
+    "hilltopads.net",
+    "adnxs.com",
+)
 
 class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
     var state by mutableStateOf(WebViewState(webContent))
@@ -145,34 +213,14 @@ fun WebViewScreenContent(
     var currentUrl by remember { mutableStateOf(url) }
     var showCloudflareHelp by remember { mutableStateOf(false) }
     var isAdBlockEnabled by remember { mutableStateOf(true) }
-    val adBlockHosts = remember {
-        setOf(
-            "doubleclick.net",
-            "googlesyndication.com",
-            "googleadservices.com",
-            "adservice.google.com",
-            "google-analytics.com",
-            "googletagmanager.com",
-            "googletagservices.com",
-            "static.cloudflareinsights.com",
-            "adsterra.com",
-            "a-ads.com",
-            "popads.net",
-            "propellerads.com",
-            "exoclick.com",
-            "juicyads.com",
-            "hilltopads.net",
-            "adnxs.com",
-            "taboola.com",
-            "outbrain.com",
-            "histats.com",
-        )
-    }
+    var loadGeneration by remember { mutableStateOf(0) }
 
     fun isAdRequest(host: String?): Boolean {
         if (host == null) return false
-        return adBlockHosts.any { host == it || host.endsWith(".$it") }
+        if (SAFE_AD_HOSTS.any { host == it || host.endsWith(".$it") }) return true
+        return AdBlockHostList.isBlocked(host)
     }
+
     var isActive by remember { mutableStateOf(true) }
 
     DisposableEffect(Unit) {
@@ -204,13 +252,32 @@ fun WebViewScreenContent(
                     currentUrl = it
                     onUrlChange(it)
                 }
+
+                AdBlockHostList.ensureLoaded(view.context.applicationContext)
+
+                // Red de seguridad: si con el bloqueo activo la página no termina de
+                // cargar en 8 segundos, se desactiva solo para esta página y se recarga.
+                if (isAdBlockEnabled) {
+                    loadGeneration++
+                    val myGeneration = loadGeneration
+                    scope.launch {
+                        delay(8_000)
+                        if (myGeneration == loadGeneration && isAdBlockEnabled) {
+                            isAdBlockEnabled = false
+                            Toast.makeText(
+                                view.context,
+                                "Bloqueo de anuncios desactivado para esta página (tardaba en cargar)",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            navigator.reload()
+                        }
+                    }
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                if (isAdBlockEnabled) {
-                    view.evaluateJavascript(ANTI_ADBLOCK_NAG_SWEEPER, null)
-                }
+                loadGeneration++
                 scope.launch {
                     val html = view.getHtml()
                     showCloudflareHelp = "window._cf_chl_opt" in html || "Ray ID is" in html
