@@ -83,8 +83,8 @@ private object AdBlockHostList {
 
     fun isBlocked(host: String?): Boolean {
         val set = hosts ?: return false
-        if (host.isNullOrEmpty()) return false
-        var current = host
+        var current: String = host ?: return false
+        if (current.isEmpty()) return false
         while (true) {
             if (set.contains(current)) return true
             val dot = current.indexOf('.')
@@ -216,9 +216,9 @@ fun WebViewScreenContent(
     var loadGeneration by remember { mutableStateOf(0) }
 
     fun isAdRequest(host: String?): Boolean {
-        if (host == null) return false
-        if (SAFE_AD_HOSTS.any { host == it || host.endsWith(".$it") }) return true
-        return AdBlockHostList.isBlocked(host)
+        val safeHost: String = host ?: return false
+        if (SAFE_AD_HOSTS.any { safeHost == it || safeHost.endsWith(".$it") }) return true
+        return AdBlockHostList.isBlocked(safeHost)
     }
 
     var isActive by remember { mutableStateOf(true) }
