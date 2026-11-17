@@ -70,8 +70,50 @@ import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 
+// Aviso "Bloqueador de anuncios detectado": se busca por texto, no por dominio.
+// Solo borra el contenedor más interno que lo contiene, con límite de tamaño,
+// para no arrasar con páginas enteras por accidente.
+private const val ANTI_ADBLOCK_NAG_SWEEPER = """
+(function() {
+    if (window.__mihonAdblockSweeperStarted) return;
+    window.__mihonAdblockSweeperStarted = true;
+    function sweep() {
+        try {
+            var sel = '[id*="adblock" i],[class*="adblock" i],[id*="ad-block" i],[class*="ad-block" i],[id*="detect-ad" i],[class*="detect-ad" i]';
+            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
+
+            var phrase = 'Bloqueador de anuncios detectado';
+            var candidates = Array.prototype.filter.call(
+                document.querySelectorAll('div,section'),
+                function(el) { return (el.textContent || '').indexOf(phrase) !== -1; },
+            );
+            var innermost = candidates.filter(function(el) {
+                return !candidates.some(function(other) { return other !== el && el.contains(other); });
+            });
+            innermost.forEach(function(el) {
+                var textLen = (el.textContent || '').length;
+                if (textLen < 3000) { el.remove(); }
+            });
+
+            [document.documentElement, document.body].forEach(function(el) {
+                if (!el) return;
+                el.style.overflow = '';
+                if (el.style.position === 'fixed') el.style.position = '';
+            });
+        } catch (e) {}
+    }
+    sweep();
+    var count = 0;
+    var id = setInterval(function() {
+        sweep();
+        count++;
+        if (count > 40) clearInterval(id);
+    }, 500);
+})();
+"""
+
 // Lista pública de dominios de publicidad (misma filosofía que AdAway).
-// Se descarga una vez y se cachea 7 días; si falla la descarga, no bloquea nada extra
+// Se descarga una vez y se cachea 7 días; si falla, no bloquea nada extra
 // (la lista corta de abajo sigue funcionando igual).
 private object AdBlockHostList {
     @Volatile private var hosts: Set<String>? = null
@@ -255,8 +297,6 @@ fun WebViewScreenContent(
 
                 AdBlockHostList.ensureLoaded(view.context.applicationContext)
 
-                // Red de seguridad: si con el bloqueo activo la página no termina de
-                // cargar en 8 segundos, se desactiva solo para esta página y se recarga.
                 if (isAdBlockEnabled) {
                     loadGeneration++
                     val myGeneration = loadGeneration
@@ -278,6 +318,9 @@ fun WebViewScreenContent(
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 loadGeneration++
+                if (isAdBlockEnabled) {
+                    view.evaluateJavascript(ANTI_ADBLOCK_NAG_SWEEPER, null)
+                }
                 scope.launch {
                     val html = view.getHtml()
                     showCloudflareHelp = "window._cf_chl_opt" in html || "Ray ID is" in html
@@ -302,13 +345,10 @@ fun WebViewScreenContent(
             ): Boolean {
                 val url = request?.url?.toString() ?: return false
 
-                // Ignore intents urls
                 if (url.startsWith("intent://")) return true
 
-                // Only send source headers to the source itself
                 if (request.url.host != headersHost) return false
 
-                // Only open valid web urls
                 if (url.startsWith("http") || url.startsWith("https")) {
                     if (url != view?.url) {
                         view?.loadUrl(url, headers)
@@ -320,7 +360,6 @@ fun WebViewScreenContent(
             }
 
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                // Not handling it kills the app along with the page
                 logcat(LogPriority.ERROR) {
                     "WebView renderer gone: crashed=${detail.didCrash()}, " +
                         "priority=${detail.rendererPriorityAtExit()}, url=$currentUrl"
@@ -340,7 +379,6 @@ fun WebViewScreenContent(
                 isUserGesture: Boolean,
                 resultMsg: Message,
             ): Boolean {
-                // if it wasn't initiated by a user gesture, we should ignore it like a normal browser would
                 if (isUserGesture) {
                     windowStack.push(WebViewWindow(resultMsg, WebViewNavigator(coroutineScope)))
                     return true
@@ -504,9 +542,6 @@ fun WebViewScreenContent(
             }
         },
     ) { contentPadding ->
-        // We need to key the WebView composable to the window object since simply updating the WebView composable will
-        // not cause it to re-invoke the WebView factory and render the new current window's WebView. This lets us
-        // completely reset the WebView composable when the current window switches.
         key(currentWindow) {
             WebView(
                 state = currentWindow.state,
@@ -517,7 +552,6 @@ fun WebViewScreenContent(
                 onCreated = { webView ->
                     webView.setDefaultSettings()
 
-                    // Debug mode (chrome://inspect/#devices)
                     if (BuildConfig.DEBUG &&
                         0 != webView.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE
                     ) {
@@ -529,13 +563,8 @@ fun WebViewScreenContent(
                 onDispose = { webView ->
                     val window = windowStack.items.find { it.webView == webView }
                     if (window == null) {
-                        // If we couldn't find any window on the stack that owns this WebView, it means that we can
-                        // safely dispose of it because the window containing it has been closed.
                         webView.destroy()
                     } else {
-                        // The composable is being disposed but the WebView object is not.
-                        // When the WebView element is recomposed, we will want the WebView to resume from its state
-                        // before it was unmounted, we won't want it to reset back to its original target.
                         window.state.content = WebContent.NavigatorOnly
                     }
                 },
