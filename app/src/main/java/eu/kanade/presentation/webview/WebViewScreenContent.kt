@@ -70,9 +70,7 @@ import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 
-// Aviso "Bloqueador de anuncios detectado": se busca por texto, no por dominio.
-// Solo borra el contenedor más interno que lo contiene, con límite de tamaño,
-// para no arrasar con páginas enteras por accidente.
+// Quita el aviso "Bloqueador de anuncios detectado" si aparece, sin esperar un intervalo fijo.
 private const val ANTI_ADBLOCK_NAG_SWEEPER = """
 (function() {
     if (window.__mihonAdblockSweeperStarted) return;
@@ -91,8 +89,7 @@ private const val ANTI_ADBLOCK_NAG_SWEEPER = """
                 return !candidates.some(function(other) { return other !== el && el.contains(other); });
             });
             innermost.forEach(function(el) {
-                var textLen = (el.textContent || '').length;
-                if (textLen < 3000) { el.remove(); }
+                if ((el.textContent || '').length < 3000) { el.remove(); }
             });
 
             [document.documentElement, document.body].forEach(function(el) {
@@ -109,6 +106,33 @@ private const val ANTI_ADBLOCK_NAG_SWEEPER = """
         count++;
         if (count > 40) clearInterval(id);
     }, 500);
+})();
+"""
+
+// Detecta si el propio sitio muestra una pantalla de "bloqueador de anuncios detectado"
+// (por clase/id, no por contenido real), para que la app apague SU PROPIO bloqueo de
+// anuncios automáticamente y recargue — lo mismo que el usuario haría a mano con el
+// botón "Ya lo desactivé, volver a cargar" del propio sitio.
+private const val ADBLOCK_SITE_BLOCK_DETECTOR = """
+(function() {
+    try {
+        var htmlCls = document.documentElement.className || '';
+        var bodyCls = (document.body && document.body.className) || '';
+        if (/adblock|antiadblock|noads|ad-detected/i.test(htmlCls) || /adblock|antiadblock|noads|ad-detected/i.test(bodyCls)) {
+            return 'true';
+        }
+        var modals = document.querySelectorAll('[id*="adblock" i],[class*="adblock" i]');
+        for (var i = 0; i < modals.length; i++) {
+            var el = modals[i];
+            var style = getComputedStyle(el);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
+                return 'true';
+            }
+        }
+        return 'false';
+    } catch (e) {
+        return 'false';
+    }
 })();
 """
 
@@ -318,9 +342,32 @@ fun WebViewScreenContent(
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 loadGeneration++
+                val myGeneration = loadGeneration
+
                 if (isAdBlockEnabled) {
                     view.evaluateJavascript(ANTI_ADBLOCK_NAG_SWEEPER, null)
+
+                    // El sitio puede tardar ~1.5-2 s en decidir que "hay un bloqueador" y
+                    // esconder su contenido; lo revisamos después de ese margen.
+                    scope.launch {
+                        delay(2_500)
+                        if (myGeneration == loadGeneration && isAdBlockEnabled) {
+                            view.evaluateJavascript(ADBLOCK_SITE_BLOCK_DETECTOR) { result ->
+                                val detected = result?.trim('"') == "true"
+                                if (detected && isAdBlockEnabled) {
+                                    isAdBlockEnabled = false
+                                    Toast.makeText(
+                                        view.context,
+                                        "Bloqueo de anuncios desactivado para esta página (el sitio lo requiere)",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                    navigator.reload()
+                                }
+                            }
+                        }
+                    }
                 }
+
                 scope.launch {
                     val html = view.getHtml()
                     showCloudflareHelp = "window._cf_chl_opt" in html || "Ray ID is" in html
