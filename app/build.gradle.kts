@@ -37,7 +37,7 @@ android {
     defaultConfig {
         applicationId = "app.mihon.pirata"
 
-        versionCode = 43
+        versionCode = 44
         versionName = "0.21.3"
 
         buildConfigField("boolean", "TELEMETRY_INCLUDED", "${Config.includeTelemetry}")
