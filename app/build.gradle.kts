@@ -255,6 +255,7 @@ dependencies {
     implementation(libs.androidx.recyclerView)
     implementation(libs.androidx.viewPager)
     implementation(libs.androidx.profileInstaller)
+    implementation("androidx.webkit:webkit:1.18.0")
 
     implementation(libs.bundles.androidx.lifecycle)
 
