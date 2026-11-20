@@ -7,6 +7,7 @@ import android.os.Message
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -35,6 +36,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import cafe.adriel.voyager.core.stack.mutableStateStackOf
 import com.kevinnzou.web.AccompanistWebChromeClient
 import com.kevinnzou.web.AccompanistWebViewClient
@@ -51,12 +55,8 @@ import eu.kanade.tachiyomi.util.system.getHtml
 import eu.kanade.tachiyomi.util.system.setDefaultSettings
 import eu.kanade.tachiyomi.util.system.setUserAgent
 import eu.kanade.tachiyomi.util.system.toast
-import java.io.ByteArrayInputStream
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import logcat.LogPriority
@@ -70,171 +70,8 @@ import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 
-// Quita el aviso "Bloqueador de anuncios detectado" si aparece, sin esperar un intervalo fijo.
-private const val ANTI_ADBLOCK_NAG_SWEEPER = """
-(function() {
-    if (window.__mihonAdblockSweeperStarted) return;
-    window.__mihonAdblockSweeperStarted = true;
-    function sweep() {
-        try {
-            var sel = '[id*="adblock" i],[class*="adblock" i],[id*="ad-block" i],[class*="ad-block" i],[id*="detect-ad" i],[class*="detect-ad" i]';
-            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
-
-            var phrase = 'Bloqueador de anuncios detectado';
-            var candidates = Array.prototype.filter.call(
-                document.querySelectorAll('div,section'),
-                function(el) { return (el.textContent || '').indexOf(phrase) !== -1; },
-            );
-            var innermost = candidates.filter(function(el) {
-                return !candidates.some(function(other) { return other !== el && el.contains(other); });
-            });
-            innermost.forEach(function(el) {
-                if ((el.textContent || '').length < 3000) { el.remove(); }
-            });
-
-            [document.documentElement, document.body].forEach(function(el) {
-                if (!el) return;
-                el.style.overflow = '';
-                if (el.style.position === 'fixed') el.style.position = '';
-            });
-        } catch (e) {}
-    }
-    sweep();
-    var count = 0;
-    var id = setInterval(function() {
-        sweep();
-        count++;
-        if (count > 40) clearInterval(id);
-    }, 500);
-})();
-"""
-
-// Detecta si el propio sitio muestra una pantalla de "bloqueador de anuncios detectado"
-// (por clase/id, no por contenido real), para que la app apague SU PROPIO bloqueo de
-// anuncios automáticamente y recargue — lo mismo que el usuario haría a mano con el
-// botón "Ya lo desactivé, volver a cargar" del propio sitio.
-private const val ADBLOCK_SITE_BLOCK_DETECTOR = """
-(function() {
-    try {
-        var htmlCls = document.documentElement.className || '';
-        var bodyCls = (document.body && document.body.className) || '';
-        if (/adblock|antiadblock|noads|ad-detected/i.test(htmlCls) || /adblock|antiadblock|noads|ad-detected/i.test(bodyCls)) {
-            return 'true';
-        }
-        var modals = document.querySelectorAll('[id*="adblock" i],[class*="adblock" i]');
-        for (var i = 0; i < modals.length; i++) {
-            var el = modals[i];
-            var style = getComputedStyle(el);
-            if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
-                return 'true';
-            }
-        }
-        return 'false';
-    } catch (e) {
-        return 'false';
-    }
-})();
-"""
-
-// Lista pública de dominios de publicidad (misma filosofía que AdAway).
-// Se descarga una vez y se cachea 7 días; si falla, no bloquea nada extra
-// (la lista corta de abajo sigue funcionando igual).
-private object AdBlockHostList {
-    @Volatile private var hosts: Set<String>? = null
-    @Volatile private var loading = false
-
-    private const val REMOTE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
-    private const val CACHE_FILE_NAME = "mihon_adblock_hosts.txt"
-    private const val MAX_AGE_MILLIS = 7L * 24 * 60 * 60 * 1000
-
-    fun isBlocked(host: String?): Boolean {
-        val set = hosts ?: return false
-        var current: String = host ?: return false
-        if (current.isEmpty()) return false
-        while (true) {
-            if (set.contains(current)) return true
-            val dot = current.indexOf('.')
-            if (dot < 0) return false
-            current = current.substring(dot + 1)
-        }
-    }
-
-    fun ensureLoaded(context: Context) {
-        if (hosts != null || loading) return
-        loading = true
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val cacheFile = File(context.filesDir, CACHE_FILE_NAME)
-                val isFresh = cacheFile.exists() &&
-                    (System.currentTimeMillis() - cacheFile.lastModified() < MAX_AGE_MILLIS)
-
-                val text = if (isFresh) {
-                    cacheFile.readText()
-                } else {
-                    val downloaded = runCatching { download(REMOTE_URL) }.getOrNull()
-                    when {
-                        downloaded != null -> {
-                            runCatching { cacheFile.writeText(downloaded) }
-                            downloaded
-                        }
-                        cacheFile.exists() -> cacheFile.readText()
-                        else -> null
-                    }
-                }
-
-                if (text != null) {
-                    hosts = parse(text)
-                }
-            } catch (e: Exception) {
-                logcat(LogPriority.ERROR, e) { "AdBlockHostList: fallo al cargar la lista" }
-            } finally {
-                loading = false
-            }
-        }
-    }
-
-    private fun download(urlStr: String): String {
-        val connection = URL(urlStr).openConnection() as HttpURLConnection
-        connection.connectTimeout = 10_000
-        connection.readTimeout = 15_000
-        return connection.inputStream.use { it.bufferedReader().readText() }
-    }
-
-    private fun parse(text: String): Set<String> {
-        val set = HashSet<String>(200_000)
-        for (rawLine in text.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.isEmpty() || line.startsWith("#")) continue
-            val parts = line.split(Regex("\\s+"))
-            if (parts.size < 2) continue
-            if (parts[0] != "0.0.0.0" && parts[0] != "127.0.0.1") continue
-            val domain = parts[1].lowercase()
-            if (domain == "localhost" || domain == "localhost.localdomain" ||
-                domain == "local" || domain == "broadcasthost"
-            ) {
-                continue
-            }
-            set.add(domain)
-        }
-        return set
-    }
-}
-
-// Lista corta y segura: dominios de anuncios directos que nunca gatillan revelar contenido.
-private val SAFE_AD_HOSTS = setOf(
-    "doubleclick.net",
-    "googlesyndication.com",
-    "googleadservices.com",
-    "adservice.google.com",
-    "adsterra.com",
-    "a-ads.com",
-    "popads.net",
-    "propellerads.com",
-    "exoclick.com",
-    "juicyads.com",
-    "hilltopads.net",
-    "adnxs.com",
-)
+private const val RELAX_TIMEOUT_MS = 7_000L
+private const val MAX_RELOADS_PER_SITE = 2
 
 class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
     var state by mutableStateOf(WebViewState(webContent))
@@ -278,38 +115,73 @@ fun WebViewScreenContent(
 
     var currentUrl by remember { mutableStateOf(url) }
     var showCloudflareHelp by remember { mutableStateOf(false) }
-    var isAdBlockEnabled by remember { mutableStateOf(true) }
-    var loadGeneration by remember { mutableStateOf(0) }
 
-    fun isAdRequest(host: String?): Boolean {
-        val safeHost: String = host ?: return false
-        if (SAFE_AD_HOSTS.any { safeHost == it || safeHost.endsWith(".$it") }) return true
-        return AdBlockHostList.isBlocked(safeHost)
-    }
+    // Nivel de bloqueo por sitio: FULL -> NETWORK_ONLY -> OFF, nunca global.
+    val relaxLevels = remember { mutableMapOf<String, RelaxLevel>() }
+    val relaxCounts = remember { mutableMapOf<String, Int>() }
+    var refreshTick by remember { mutableStateOf(0) }
+
+    fun siteOf(target: String?): String =
+        target?.let { runCatching { it.toUri().host }.getOrNull() }?.lowercase() ?: ""
+
+    fun levelFor(target: String?): RelaxLevel = relaxLevels[siteOf(target)] ?: RelaxLevel.FULL
 
     var isActive by remember { mutableStateOf(true) }
-
-    DisposableEffect(Unit) {
-        onDispose { isActive = false }
-    }
+    DisposableEffect(Unit) { onDispose { isActive = false } }
 
     val headersHost = remember { url.toUri().host }
+    val scriptHandlers = remember { mutableListOf<ScriptHandler>() }
+    var relaxJob by remember { mutableStateOf<Job?>(null) }
+    var committed by remember { mutableStateOf(false) }
 
-    val webClient = remember {
+    fun relax(target: String?, reason: String) {
+        val site = siteOf(target)
+        if (site.isEmpty()) return
+        val current = relaxLevels[site] ?: RelaxLevel.FULL
+        if (current == RelaxLevel.OFF) return
+        if ((relaxCounts[site] ?: 0) >= MAX_RELOADS_PER_SITE) return
+        relaxCounts[site] = (relaxCounts[site] ?: 0) + 1
+        relaxLevels[site] = if (current == RelaxLevel.FULL) RelaxLevel.NETWORK_ONLY else RelaxLevel.OFF
+        refreshTick++
+        Toast.makeText(
+            currentWindow.webView?.context ?: return,
+            when (relaxLevels[site]) {
+                RelaxLevel.NETWORK_ONLY -> "Bloqueo reducido en este sitio ($reason)"
+                else -> "Bloqueo desactivado en este sitio ($reason)"
+            },
+            Toast.LENGTH_SHORT,
+        ).show()
+        navigator.reload()
+    }
+
+    fun injectHostScripts(view: WebView, target: String?) {
+        val site = siteOf(target)
+        val level = levelFor(target)
+        if (level != RelaxLevel.FULL) return
+        val css = AdBlocker.cosmeticCssFor(site)
+        val scriptlets = AdBlocker.scriptletsFor(site)
+        if (css.isEmpty() && scriptlets.isEmpty()) return
+        val payload = scriptlets.joinToString("") + Scriptlets.build(site, css, level)
+        view.evaluateJavascript(payload, null)
+    }
+
+    val webClient = remember(refreshTick) {
         object : AccompanistWebViewClient() {
 
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest,
             ): WebResourceResponse? {
-                if (isAdBlockEnabled && isAdRequest(request.url.host)) {
-                    return WebResourceResponse(
-                        "text/plain",
-                        "UTF-8",
-                        ByteArrayInputStream(ByteArray(0)),
-                    )
+                return try {
+                    if (levelFor(view.url) == RelaxLevel.OFF) return super.shouldInterceptRequest(view, request)
+                    if (AdBlocker.shouldBlock(request, view.url)) {
+                        AdBlocker.blockedResponse(request)
+                    } else {
+                        super.shouldInterceptRequest(view, request)
+                    }
+                } catch (e: Exception) {
+                    super.shouldInterceptRequest(view, request)
                 }
-                return super.shouldInterceptRequest(view, request)
             }
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
@@ -318,60 +190,49 @@ fun WebViewScreenContent(
                     currentUrl = it
                     onUrlChange(it)
                 }
+                AdBlocker.ensureLoaded(view.context.applicationContext)
+                committed = false
 
-                AdBlockHostList.ensureLoaded(view.context.applicationContext)
+                injectHostScripts(view, url ?: currentUrl)
 
-                if (isAdBlockEnabled) {
-                    loadGeneration++
-                    val myGeneration = loadGeneration
-                    scope.launch {
-                        delay(8_000)
-                        if (myGeneration == loadGeneration && isAdBlockEnabled) {
-                            isAdBlockEnabled = false
-                            Toast.makeText(
-                                view.context,
-                                "Bloqueo de anuncios desactivado para esta página (tardaba en cargar)",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                            navigator.reload()
-                        }
+                relaxJob?.cancel()
+                if (levelFor(url ?: currentUrl) != RelaxLevel.OFF) {
+                    val target = url ?: currentUrl
+                    relaxJob = scope.launch {
+                        delay(RELAX_TIMEOUT_MS)
+                        if (!committed && isActive) relax(target, "no cargaba")
                     }
                 }
             }
 
+            override fun onPageCommitVisible(view: WebView, url: String?) {
+                super.onPageCommitVisible(view, url)
+                committed = true
+                relaxJob?.cancel()
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                loadGeneration++
-                val myGeneration = loadGeneration
+                if (!committed) committed = true
+                relaxJob?.cancel()
 
-                if (isAdBlockEnabled) {
-                    view.evaluateJavascript(ANTI_ADBLOCK_NAG_SWEEPER, null)
-
-                    // El sitio puede tardar ~1.5-2 s en decidir que "hay un bloqueador" y
-                    // esconder su contenido; lo revisamos después de ese margen.
-                    scope.launch {
-                        delay(2_500)
-                        if (myGeneration == loadGeneration && isAdBlockEnabled) {
-                            view.evaluateJavascript(ADBLOCK_SITE_BLOCK_DETECTOR) { result ->
-                                val detected = result?.trim('"') == "true"
-                                if (detected && isAdBlockEnabled) {
-                                    isAdBlockEnabled = false
-                                    Toast.makeText(
-                                        view.context,
-                                        "Bloqueo de anuncios desactivado para esta página (el sitio lo requiere)",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                    navigator.reload()
-                                }
-                            }
-                        }
-                    }
+                if (levelFor(url ?: currentUrl) == RelaxLevel.FULL) {
+                    injectHostScripts(view, url ?: currentUrl)
                 }
 
                 scope.launch {
                     val html = view.getHtml()
                     showCloudflareHelp = "window._cf_chl_opt" in html || "Ray ID is" in html
                 }
+            }
+
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request.isForMainFrame && isActive) relax(view.url, "error de red")
             }
 
             override fun doUpdateVisitedHistory(
@@ -390,19 +251,15 @@ fun WebViewScreenContent(
                 view: WebView?,
                 request: WebResourceRequest?,
             ): Boolean {
-                val url = request?.url?.toString() ?: return false
-
-                if (url.startsWith("intent://")) return true
-
+                val target = request?.url?.toString() ?: return false
+                if (target.startsWith("intent://")) return true
                 if (request.url.host != headersHost) return false
-
-                if (url.startsWith("http") || url.startsWith("https")) {
-                    if (url != view?.url) {
-                        view?.loadUrl(url, headers)
+                if (target.startsWith("http")) {
+                    if (target != view?.url) {
+                        view?.loadUrl(target, headers)
                         return true
                     }
                 }
-
                 return false
             }
 
@@ -434,18 +291,12 @@ fun WebViewScreenContent(
             }
 
             override fun onJsAlert(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
-                if (!isActive) {
-                    result.confirm()
-                    return true
-                }
+                if (!isActive) { result.confirm(); return true }
                 return super.onJsAlert(view, url, message, result)
             }
 
             override fun onJsConfirm(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
-                if (!isActive) {
-                    result.cancel()
-                    return true
-                }
+                if (!isActive) { result.cancel(); return true }
                 return super.onJsConfirm(view, url, message, result)
             }
 
@@ -456,10 +307,7 @@ fun WebViewScreenContent(
                 defaultValue: String?,
                 result: JsPromptResult,
             ): Boolean {
-                if (!isActive) {
-                    result.cancel()
-                    return true
-                }
+                if (!isActive) { result.cancel(); return true }
                 return super.onJsPrompt(view, url, message, defaultValue, result)
             }
         }
@@ -474,11 +322,7 @@ fun WebViewScreenContent(
 
     val popState = remember<() -> Unit> {
         {
-            if (windowStack.size == 1) {
-                onNavigateUp()
-            } else {
-                windowStack.pop()
-            }
+            if (windowStack.size == 1) onNavigateUp() else windowStack.pop()
         }
     }
 
@@ -499,21 +343,13 @@ fun WebViewScreenContent(
                                     AppBar.Action(
                                         title = stringResource(MR.strings.action_webview_back),
                                         icon = MaterialSymbols.AutoMirroredRounded.ArrowBack,
-                                        onClick = {
-                                            if (navigator.canGoBack) {
-                                                navigator.navigateBack()
-                                            }
-                                        },
+                                        onClick = { if (navigator.canGoBack) navigator.navigateBack() },
                                         enabled = navigator.canGoBack,
                                     ),
                                     AppBar.Action(
                                         title = stringResource(MR.strings.action_webview_forward),
                                         icon = MaterialSymbols.AutoMirroredRounded.ArrowForward,
-                                        onClick = {
-                                            if (navigator.canGoForward) {
-                                                navigator.navigateForward()
-                                            }
-                                        },
+                                        onClick = { if (navigator.canGoForward) navigator.navigateForward() },
                                         enabled = navigator.canGoForward,
                                     ),
                                     AppBar.OverflowAction(
@@ -533,9 +369,20 @@ fun WebViewScreenContent(
                                         onClick = { onClearCookies(currentUrl) },
                                     ),
                                     AppBar.OverflowAction(
-                                        title = if (isAdBlockEnabled) "Desactivar bloqueo de anuncios" else "Activar bloqueo de anuncios",
+                                        title = when (levelFor(currentUrl)) {
+                                            RelaxLevel.FULL -> "Bloqueo: completo (toca para desactivar)"
+                                            RelaxLevel.NETWORK_ONLY -> "Bloqueo: solo red (toca para desactivar)"
+                                            RelaxLevel.OFF -> "Bloqueo: desactivado (toca para activar)"
+                                        },
                                         onClick = {
-                                            isAdBlockEnabled = !isAdBlockEnabled
+                                            val site = siteOf(currentUrl)
+                                            if (levelFor(currentUrl) == RelaxLevel.OFF) {
+                                                relaxLevels.remove(site)
+                                                relaxCounts.remove(site)
+                                            } else {
+                                                relaxLevels[site] = RelaxLevel.OFF
+                                            }
+                                            refreshTick++
                                             navigator.reload()
                                         },
                                     ),
@@ -556,9 +403,7 @@ fun WebViewScreenContent(
                     )
 
                     if (showCloudflareHelp) {
-                        Surface(
-                            modifier = Modifier.padding(8.dp),
-                        ) {
+                        Surface(modifier = Modifier.padding(8.dp)) {
                             WarningBanner(
                                 textRes = MR.strings.information_cloudflare_help,
                                 modifier = Modifier
@@ -574,15 +419,11 @@ fun WebViewScreenContent(
                 }
                 when (val loadingState = currentWindow.state.loadingState) {
                     is LoadingState.Initializing -> LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter),
+                        modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter),
                     )
                     is LoadingState.Loading -> LinearProgressIndicator(
                         progress = { loadingState.progress },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter),
+                        modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter),
                     )
                     else -> {}
                 }
@@ -592,9 +433,7 @@ fun WebViewScreenContent(
         key(currentWindow) {
             WebView(
                 state = currentWindow.state,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(contentPadding),
+                modifier = Modifier.fillMaxSize().padding(contentPadding),
                 navigator = navigator,
                 onCreated = { webView ->
                     webView.setDefaultSettings()
@@ -606,8 +445,24 @@ fun WebViewScreenContent(
                     }
 
                     webView.setUserAgent(headers["user-agent"] ?: defaultUserAgentProvider())
+
+                    AdBlocker.ensureLoaded(webView.context.applicationContext)
+
+                    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                        val handler = runCatching {
+                            WebViewCompat.addDocumentStartJavaScript(
+                                webView,
+                                Scriptlets.ANTI_DETECT + Scriptlets.POPUP_DEFUSER + Scriptlets.WALL_SWEEPER,
+                                setOf("*"),
+                            )
+                        }.getOrNull()
+                        handler?.let { scriptHandlers.add(it) }
+                    }
                 },
                 onDispose = { webView ->
+                    relaxJob?.cancel()
+                    scriptHandlers.forEach { runCatching { it.remove() } }
+                    scriptHandlers.clear()
                     val window = windowStack.items.find { it.webView == webView }
                     if (window == null) {
                         webView.destroy()
@@ -621,9 +476,7 @@ fun WebViewScreenContent(
                     currentWindow.webView
                         ?: WebView(context).also { webView ->
                             currentWindow.webView = webView
-                            currentWindow.popupMessage?.let {
-                                initializePopup(webView, it)
-                            }
+                            currentWindow.popupMessage?.let { initializePopup(webView, it) }
                         }
                 },
             )
