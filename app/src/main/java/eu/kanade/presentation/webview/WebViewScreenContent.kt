@@ -83,6 +83,32 @@ enum class RelaxLevel { FULL, NETWORK_ONLY, OFF }
 // El script destructor del cartel de Aedex
 private const val CUSTOM_AEDEX_SWEEPER = """
 (function() {
+    // 1. ANTI-DETECCIÓN BÁSICA
+    try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
+        Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        if (!window.chrome) { window.chrome = { runtime: {} }; }
+    } catch (e) {}
+
+    // 2. FALSIFICAR TARJETA GRÁFICA (Para engañar a Cloudflare)
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Qualcomm'; // Vendor
+            if (parameter === 37446) return 'Adreno (TM) 730'; // Renderer
+            return getParameter.apply(this, arguments);
+        };
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Qualcomm';
+            if (parameter === 37446) return 'Adreno (TM) 730';
+            return getParameter2.apply(this, arguments);
+        };
+    } catch (e) {}
+
+    // 3. DESTRUCTOR DEL CARTEL DE AEDEX
     if (window.__aedexSweeperStarted) return;
     window.__aedexSweeperStarted = true;
     function sweep() {
