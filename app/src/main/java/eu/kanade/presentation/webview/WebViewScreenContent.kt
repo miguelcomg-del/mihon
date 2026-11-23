@@ -7,7 +7,6 @@ import android.os.Message
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
-import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -55,7 +54,12 @@ import eu.kanade.tachiyomi.util.system.getHtml
 import eu.kanade.tachiyomi.util.system.setDefaultSettings
 import eu.kanade.tachiyomi.util.system.setUserAgent
 import eu.kanade.tachiyomi.util.system.toast
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -73,7 +77,10 @@ import tachiyomi.presentation.core.i18n.stringResource
 private const val RELAX_TIMEOUT_MS = 7_000L
 private const val MAX_RELOADS_PER_SITE = 2
 
-// Script personalizado para destruir el cartel de Aedex y desbloquear el scroll
+// Enums que faltaban en tu código
+enum class RelaxLevel { FULL, NETWORK_ONLY, OFF }
+
+// El script destructor del cartel de Aedex
 private const val CUSTOM_AEDEX_SWEEPER = """
 (function() {
     if (window.__aedexSweeperStarted) return;
@@ -86,7 +93,6 @@ private const val CUSTOM_AEDEX_SWEEPER = """
                 var text = el.textContent || '';
                 if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 2000) {
                     el.remove();
-                    // Desbloquea el scroll por si el cartel bloqueó la pantalla
                     if (document.body) document.body.style.overflow = 'auto';
                     if (document.documentElement) document.documentElement.style.overflow = 'auto';
                 }
@@ -98,10 +104,84 @@ private const val CUSTOM_AEDEX_SWEEPER = """
     var id = setInterval(function() {
         sweep();
         count++;
-        if (count > 30) clearInterval(id); // Barre por 15 segundos
+        if (count > 30) clearInterval(id);
     }, 500);
 })();
 """
+
+// Bloqueador de anuncios (Rescatado de tu primera versión)
+private object AdBlockHostList {
+    @Volatile private var hosts: Set<String>? = null
+    @Volatile private var loading = false
+
+    private const val REMOTE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    private const val CACHE_FILE_NAME = "mihon_adblock_hosts.txt"
+    private const val MAX_AGE_MILLIS = 7L * 24 * 60 * 60 * 1000
+
+    fun isBlocked(host: String?): Boolean {
+        val set = hosts ?: return false
+        var current: String = host ?: return false
+        if (current.isEmpty()) return false
+        while (true) {
+            if (set.contains(current)) return true
+            val dot = current.indexOf('.')
+            if (dot < 0) return false
+            current = current.substring(dot + 1)
+        }
+    }
+
+    fun ensureLoaded(context: Context) {
+        if (hosts != null || loading) return
+        loading = true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val cacheFile = File(context.filesDir, CACHE_FILE_NAME)
+                val isFresh = cacheFile.exists() && (System.currentTimeMillis() - cacheFile.lastModified() < MAX_AGE_MILLIS)
+                val text = if (isFresh) cacheFile.readText() else {
+                    val downloaded = runCatching { download(REMOTE_URL) }.getOrNull()
+                    when {
+                        downloaded != null -> { runCatching { cacheFile.writeText(downloaded) }; downloaded }
+                        cacheFile.exists() -> cacheFile.readText()
+                        else -> null
+                    }
+                }
+                if (text != null) hosts = parse(text)
+            } catch (e: Exception) {
+                logcat(LogPriority.ERROR, e) { "AdBlockHostList: fallo al cargar la lista" }
+            } finally {
+                loading = false
+            }
+        }
+    }
+
+    private fun download(urlStr: String): String {
+        val connection = URL(urlStr).openConnection() as HttpURLConnection
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 15_000
+        return connection.inputStream.use { it.bufferedReader().readText() }
+    }
+
+    private fun parse(text: String): Set<String> {
+        val set = HashSet<String>(200_000)
+        for (rawLine in text.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val parts = line.split(Regex("\\s+"))
+            if (parts.size < 2) continue
+            if (parts[0] != "0.0.0.0" && parts[0] != "127.0.0.1") continue
+            val domain = parts[1].lowercase()
+            if (domain == "localhost" || domain == "localhost.localdomain" || domain == "local" || domain == "broadcasthost") continue
+            set.add(domain)
+        }
+        return set
+    }
+}
+
+private val SAFE_AD_HOSTS = setOf(
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+    "adsterra.com", "a-ads.com", "popads.net", "propellerads.com", "exoclick.com",
+    "juicyads.com", "hilltopads.net", "adnxs.com"
+)
 
 class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
     var state by mutableStateOf(WebViewState(webContent))
@@ -139,21 +219,17 @@ fun WebViewScreenContent(
 
     val currentWindow = windowStack.lastItemOrNull!!
     val navigator = currentWindow.navigator
-
     val uriHandler = LocalUriHandler.current
     val scope = rememberCoroutineScope()
 
     var currentUrl by remember { mutableStateOf(url) }
     var showCloudflareHelp by remember { mutableStateOf(false) }
 
-    // Nivel de bloqueo por sitio: FULL -> NETWORK_ONLY -> OFF, nunca global.
     val relaxLevels = remember { mutableMapOf<String, RelaxLevel>() }
     val relaxCounts = remember { mutableMapOf<String, Int>() }
     var refreshTick by remember { mutableStateOf(0) }
 
-    fun siteOf(target: String?): String =
-        target?.let { runCatching { it.toUri().host }.getOrNull() }?.lowercase() ?: ""
-
+    fun siteOf(target: String?): String = target?.let { runCatching { it.toUri().host }.getOrNull() }?.lowercase() ?: ""
     fun levelFor(target: String?): RelaxLevel = relaxLevels[siteOf(target)] ?: RelaxLevel.FULL
 
     var isActive by remember { mutableStateOf(true) }
@@ -177,35 +253,23 @@ fun WebViewScreenContent(
             currentWindow.webView?.context ?: return,
             when (relaxLevels[site]) {
                 RelaxLevel.NETWORK_ONLY -> "Bloqueo reducido en este sitio ($reason)"
-                else -> "Bloqueo desactivado en este sitio ($reason)"
+                RelaxLevel.OFF -> "Bloqueo desactivado en este sitio ($reason)"
+                else -> "Bloqueo actualizado"
             },
             Toast.LENGTH_SHORT,
         ).show()
         navigator.reload()
     }
 
-    fun injectHostScripts(view: WebView, target: String?) {
-        val site = siteOf(target)
-        val level = levelFor(target)
-        if (level != RelaxLevel.FULL) return
-        val css = AdBlocker.cosmeticCssFor(site)
-        val scriptlets = AdBlocker.scriptletsFor(site)
-        if (css.isEmpty() && scriptlets.isEmpty()) return
-        val payload = scriptlets.joinToString("") + Scriptlets.build(site, css, level)
-        view.evaluateJavascript(payload, null)
-    }
-
     val webClient = remember(refreshTick) {
         object : AccompanistWebViewClient() {
-
-            override fun shouldInterceptRequest(
-                view: WebView,
-                request: WebResourceRequest,
-            ): WebResourceResponse? {
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 return try {
                     if (levelFor(view.url) == RelaxLevel.OFF) return super.shouldInterceptRequest(view, request)
-                    if (AdBlocker.shouldBlock(request, view.url)) {
-                        AdBlocker.blockedResponse(request)
+                    val host = request.url.host
+                    val isBlocked = host != null && (SAFE_AD_HOSTS.any { host == it || host.endsWith(".$it") } || AdBlockHostList.isBlocked(host))
+                    if (isBlocked) {
+                        WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
                     } else {
                         super.shouldInterceptRequest(view, request)
                     }
@@ -220,13 +284,11 @@ fun WebViewScreenContent(
                     currentUrl = it
                     onUrlChange(it)
                 }
-                AdBlocker.ensureLoaded(view.context.applicationContext)
+                AdBlockHostList.ensureLoaded(view.context.applicationContext)
                 committed = false
 
-                // INYECCIÓN DEL SCRIPT DE AEDEX
+                // Inyectar el destructor de carteles
                 view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
-
-                injectHostScripts(view, url ?: currentUrl)
 
                 relaxJob?.cancel()
                 if (levelFor(url ?: currentUrl) != RelaxLevel.OFF) {
@@ -249,12 +311,8 @@ fun WebViewScreenContent(
                 if (!committed) committed = true
                 relaxJob?.cancel()
 
-                // INYECCIÓN DEL SCRIPT DE AEDEX POR SEGUNDA VEZ (por si carga dinámicamente)
+                // Volver a inyectar por si acaso
                 view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
-
-                if (levelFor(url ?: currentUrl) == RelaxLevel.FULL) {
-                    injectHostScripts(view, url ?: currentUrl)
-                }
 
                 scope.launch {
                     val html = view.getHtml()
@@ -262,20 +320,7 @@ fun WebViewScreenContent(
                 }
             }
 
-            override fun onReceivedError(
-                view: WebView,
-                request: WebResourceRequest,
-                error: WebResourceError,
-            ) {
-                super.onReceivedError(view, request, error)
-                if (request.isForMainFrame && isActive) relax(view.url, "error de red")
-            }
-
-            override fun doUpdateVisitedHistory(
-                view: WebView,
-                url: String?,
-                isReload: Boolean,
-            ) {
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                 super.doUpdateVisitedHistory(view, url, isReload)
                 url?.let {
                     currentUrl = it
@@ -283,10 +328,7 @@ fun WebViewScreenContent(
                 }
             }
 
-            override fun shouldOverrideUrlLoading(
-                view: WebView?,
-                request: WebResourceRequest?,
-            ): Boolean {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val target = request?.url?.toString() ?: return false
                 if (target.startsWith("intent://")) return true
                 if (request.url.host != headersHost) return false
@@ -313,12 +355,7 @@ fun WebViewScreenContent(
 
     val webChromeClient = remember {
         object : AccompanistWebChromeClient() {
-            override fun onCreateWindow(
-                view: WebView,
-                isDialog: Boolean,
-                isUserGesture: Boolean,
-                resultMsg: Message,
-            ): Boolean {
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
                 if (isUserGesture) {
                     windowStack.push(WebViewWindow(resultMsg, WebViewNavigator(coroutineScope)))
                     return true
@@ -336,13 +373,7 @@ fun WebViewScreenContent(
                 return super.onJsConfirm(view, url, message, result)
             }
 
-            override fun onJsPrompt(
-                view: WebView,
-                url: String?,
-                message: String?,
-                defaultValue: String?,
-                result: JsPromptResult,
-            ): Boolean {
+            override fun onJsPrompt(view: WebView, url: String?, message: String?, defaultValue: String?, result: JsPromptResult): Boolean {
                 if (!isActive) { result.cancel(); return true }
                 return super.onJsPrompt(view, url, message, defaultValue, result)
             }
@@ -357,9 +388,7 @@ fun WebViewScreenContent(
     }
 
     val popState = remember<() -> Unit> {
-        {
-            if (windowStack.size == 1) onNavigateUp() else windowStack.pop()
-        }
+        { if (windowStack.size == 1) onNavigateUp() else windowStack.pop() }
     }
 
     BackHandler(windowStack.size > 1, popState)
@@ -424,14 +453,11 @@ fun WebViewScreenContent(
                                     ),
                                 ).toMutableList().apply {
                                     if (windowStack.size > 1) {
-                                        add(
-                                            0,
-                                            AppBar.Action(
-                                                title = stringResource(MR.strings.action_webview_close_tab),
-                                                icon = MaterialSymbols.Rounded.TabClose,
-                                                onClick = popState,
-                                            ),
-                                        )
+                                        add(0, AppBar.Action(
+                                            title = stringResource(MR.strings.action_webview_close_tab),
+                                            icon = MaterialSymbols.Rounded.TabClose,
+                                            onClick = popState,
+                                        ))
                                     }
                                 },
                             )
@@ -445,9 +471,7 @@ fun WebViewScreenContent(
                                 modifier = Modifier
                                     .clip(MaterialTheme.shapes.small)
                                     .clickable {
-                                        uriHandler.openUri(
-                                            "https://mihon.app/docs/guides/troubleshooting/#cloudflare",
-                                        )
+                                        uriHandler.openUri("https://mihon.app/docs/guides/troubleshooting/#cloudflare")
                                     },
                             )
                         }
@@ -474,22 +498,20 @@ fun WebViewScreenContent(
                 onCreated = { webView ->
                     webView.setDefaultSettings()
 
-                    if (BuildConfig.DEBUG &&
-                        0 != webView.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE
-                    ) {
+                    if (BuildConfig.DEBUG && 0 != webView.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) {
                         WebView.setWebContentsDebuggingEnabled(true)
                     }
 
-                    // CAMBIO CLAVE: User-Agent falso de Chrome Android para que Aedex no detecte el WebView
+                    // MAGIA: User-Agent de Chrome para burlar la detección de WebView
                     webView.setUserAgent("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
-                    AdBlocker.ensureLoaded(webView.context.applicationContext)
+                    AdBlockHostList.ensureLoaded(webView.context.applicationContext)
 
                     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                         val handler = runCatching {
                             WebViewCompat.addDocumentStartJavaScript(
                                 webView,
-                                Scriptlets.ANTI_DETECT + Scriptlets.POPUP_DEFUSER + Scriptlets.WALL_SWEEPER + CUSTOM_AEDEX_SWEEPER,
+                                CUSTOM_AEDEX_SWEEPER,
                                 setOf("*"),
                             )
                         }.getOrNull()
@@ -510,11 +532,10 @@ fun WebViewScreenContent(
                 client = webClient,
                 chromeClient = webChromeClient,
                 factory = { context ->
-                    currentWindow.webView
-                        ?: WebView(context).also { webView ->
-                            currentWindow.webView = webView
-                            currentWindow.popupMessage?.let { initializePopup(webView, it) }
-                        }
+                    currentWindow.webView ?: WebView(context).also { webView ->
+                        currentWindow.webView = webView
+                        currentWindow.popupMessage?.let { initializePopup(webView, it) }
+                    }
                 },
             )
         }
