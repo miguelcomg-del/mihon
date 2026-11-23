@@ -80,58 +80,84 @@ private const val MAX_RELOADS_PER_SITE = 2
 // Enums que faltaban en tu código
 enum class RelaxLevel { FULL, NETWORK_ONLY, OFF }
 
-// El script destructor del cartel de Aedex
+// Bypass definitivo para Aedex/Blayvia: Anti-Bloqueo, Anti-Click y Falso AdBlock
 private const val CUSTOM_AEDEX_SWEEPER = """
 (function() {
-    // 1. ANTI-DETECCIÓN BÁSICA
+    // 1. Anti-Detección (Falsificamos el navegador)
     try {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
         Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         if (!window.chrome) { window.chrome = { runtime: {} }; }
     } catch (e) {}
 
-    // 2. FALSIFICAR TARJETA GRÁFICA (Para engañar a Cloudflare)
-    try {
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Qualcomm'; // Vendor
-            if (parameter === 37446) return 'Adreno (TM) 730'; // Renderer
-            return getParameter.apply(this, arguments);
+    // 2. Falsificamos Google Tag Manager (para que crean que los anuncios cargaron)
+    window.googletag = window.googletag || {};
+    window.googletag.apiReady = true;
+    window.googletag.cmd = window.googletag.cmd || { push: function(f) { try { f(); } catch(e){} } };
+    window.googletag.pubads = window.googletag.pubads || function() {
+        return {
+            addEventListener: function() {},
+            enableLazyLoad: function() {},
+            collapseEmptyDivs: function() {},
+            addService: function() {}
         };
-        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Qualcomm';
-            if (parameter === 37446) return 'Adreno (TM) 730';
-            return getParameter2.apply(this, arguments);
-        };
-    } catch (e) {}
+    };
+    window.googletag.defineSlot = window.googletag.defineSlot || function() { return { addService: function() {} }; };
+    window.googletag.defineOutOfPageSlot = window.googletag.defineOutOfPageSlot || function() { return { addService: function() {} }; };
+    window.googletag.enableServices = window.googletag.enableServices || function() {};
+    window.googletag.display = window.googletag.display || function() {};
 
-    // 3. DESTRUCTOR DEL CARTEL DE AEDEX
-    if (window.__aedexSweeperStarted) return;
-    window.__aedexSweeperStarted = true;
-    function sweep() {
+    // 3. Interceptamos el fetch de anuncios para que no falle
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const url = args[0];
+        if (typeof url === 'string' && url.includes('securepubads.g.doubleclick.net')) {
+            return new Response('', { status: 200 });
+        }
+        return originalFetch.apply(this, args);
+    };
+
+    // 4. EVITAMOS QUE BORREN LA PANTALLA
+    const originalRemove = Element.prototype.remove;
+    Element.prototype.remove = function() {
+        if (this.className === 'reading-content' || (this.classList && this.classList.contains('manga-canvas-wrapper'))) {
+            console.log("Bloqueado intento de borrar el contenido");
+            return; // No dejamos que borren el manga
+        }
+        originalRemove.call(this);
+    };
+
+    // 5. Hacemos que el detector de AdBlock crea que los anuncios están visibles
+    const originalAppendChild = Node.prototype.appendChild;
+    Node.prototype.appendChild = function(child) {
+        if (child.className && typeof child.className === 'string' && child.className.includes('adsbox')) {
+            Object.defineProperty(child, 'offsetHeight', { get: () => 250 });
+            Object.defineProperty(child, 'offsetWidth', { get: () => 300 });
+        }
+        return originalAppendChild.call(this, child);
+    };
+
+    // 6. Limpiamos los carteles de error y anuncios flotantes
+    setInterval(function() {
         try {
-            var phrases = ['Abre Aedex en tu navegador', 'Abrir en el navegador', 'Copiar enlace'];
-            var divs = document.querySelectorAll('div, section, [role="dialog"]');
+            document.documentElement.classList.remove('adblock-blocked', 'brave-blocked', 'is-lector');
+            var phrases = ['Abre Aedex en tu navegador', 'Bloqueador de anuncios detectado', 'Contenido Protegido', 'Navegador no compatible'];
+            var divs = document.querySelectorAll('div, section');
             divs.forEach(function(el) {
-                var text = el.textContent || '';
-                if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 2000) {
-                    el.remove();
-                    if (document.body) document.body.style.overflow = 'auto';
-                    if (document.documentElement) document.documentElement.style.overflow = 'auto';
+                if (el.style.display !== 'none' && el.id !== 'manga-page-canvas') {
+                    var text = el.textContent || '';
+                    if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 3000) {
+                        el.style.display = 'none';
+                    }
                 }
             });
-        } catch (e) {}
-    }
-    sweep();
-    var count = 0;
-    var id = setInterval(function() {
-        sweep();
-        count++;
-        if (count > 30) clearInterval(id);
-    }, 500);
+            // Ocultar anuncios visualmente
+            document.querySelectorAll('.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield').forEach(function(a) {
+                if(a) a.style.display = 'none';
+            });
+        } catch(e) {}
+    }, 1000);
 })();
 """
 
