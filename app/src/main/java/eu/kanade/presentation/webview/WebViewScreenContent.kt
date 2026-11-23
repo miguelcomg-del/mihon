@@ -73,6 +73,36 @@ import tachiyomi.presentation.core.i18n.stringResource
 private const val RELAX_TIMEOUT_MS = 7_000L
 private const val MAX_RELOADS_PER_SITE = 2
 
+// Script personalizado para destruir el cartel de Aedex y desbloquear el scroll
+private const val CUSTOM_AEDEX_SWEEPER = """
+(function() {
+    if (window.__aedexSweeperStarted) return;
+    window.__aedexSweeperStarted = true;
+    function sweep() {
+        try {
+            var phrases = ['Abre Aedex en tu navegador', 'Abrir en el navegador', 'Copiar enlace'];
+            var divs = document.querySelectorAll('div, section, [role="dialog"]');
+            divs.forEach(function(el) {
+                var text = el.textContent || '';
+                if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 2000) {
+                    el.remove();
+                    // Desbloquea el scroll por si el cartel bloqueó la pantalla
+                    if (document.body) document.body.style.overflow = 'auto';
+                    if (document.documentElement) document.documentElement.style.overflow = 'auto';
+                }
+            });
+        } catch (e) {}
+    }
+    sweep();
+    var count = 0;
+    var id = setInterval(function() {
+        sweep();
+        count++;
+        if (count > 30) clearInterval(id); // Barre por 15 segundos
+    }, 500);
+})();
+"""
+
 class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
     var state by mutableStateOf(WebViewState(webContent))
     var popupMessage: Message? = null
@@ -193,6 +223,9 @@ fun WebViewScreenContent(
                 AdBlocker.ensureLoaded(view.context.applicationContext)
                 committed = false
 
+                // INYECCIÓN DEL SCRIPT DE AEDEX
+                view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
+
                 injectHostScripts(view, url ?: currentUrl)
 
                 relaxJob?.cancel()
@@ -215,6 +248,9 @@ fun WebViewScreenContent(
                 super.onPageFinished(view, url)
                 if (!committed) committed = true
                 relaxJob?.cancel()
+
+                // INYECCIÓN DEL SCRIPT DE AEDEX POR SEGUNDA VEZ (por si carga dinámicamente)
+                view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
 
                 if (levelFor(url ?: currentUrl) == RelaxLevel.FULL) {
                     injectHostScripts(view, url ?: currentUrl)
@@ -444,7 +480,8 @@ fun WebViewScreenContent(
                         WebView.setWebContentsDebuggingEnabled(true)
                     }
 
-                    webView.setUserAgent(headers["user-agent"] ?: defaultUserAgentProvider())
+                    // CAMBIO CLAVE: User-Agent falso de Chrome Android para que Aedex no detecte el WebView
+                    webView.setUserAgent("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
                     AdBlocker.ensureLoaded(webView.context.applicationContext)
 
@@ -452,7 +489,7 @@ fun WebViewScreenContent(
                         val handler = runCatching {
                             WebViewCompat.addDocumentStartJavaScript(
                                 webView,
-                                Scriptlets.ANTI_DETECT + Scriptlets.POPUP_DEFUSER + Scriptlets.WALL_SWEEPER,
+                                Scriptlets.ANTI_DETECT + Scriptlets.POPUP_DEFUSER + Scriptlets.WALL_SWEEPER + CUSTOM_AEDEX_SWEEPER,
                                 setOf("*"),
                             )
                         }.getOrNull()
