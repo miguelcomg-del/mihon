@@ -80,10 +80,9 @@ private const val MAX_RELOADS_PER_SITE = 2
 
 enum class RelaxLevel { FULL, NETWORK_ONLY, OFF }
 
-// SCRIPT 1: SOLO PARA EL LOGIN (Falsifica navegador y anuncios, NO toca el DOM)
+// SCRIPT 1: LOGIN (Falsifica navegador y oculta carteles de forma segura)
 private const val CUSTOM_BROWSER_SPOOF = """
 (function() {
-    // 1. Anti-Detección
     try {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
@@ -91,12 +90,10 @@ private const val CUSTOM_BROWSER_SPOOF = """
         if (!window.chrome) { window.chrome = { runtime: {} }; }
     } catch (e) {}
 
-    // 2. Inyectar CSS para ocultar los carteles de "Abre en tu navegador" (SEGURO PARA REACT)
     var style = document.createElement('style');
     style.innerHTML = '.lector-block, #devtools-block-modal, #adblock-block-modal, #brave-block-modal { display: none !important; }';
     if (document.head) document.head.appendChild(style);
 
-    // 3. Ocultar cualquier otro cartel dinámico usando MutationObserver (sin romper React)
     function hideModals() {
         var phrases = ['Abre Aedex en tu navegador', 'Abrir en el navegador', 'Copiar enlace'];
         var divs = document.querySelectorAll('div, section, [role="dialog"]');
@@ -104,7 +101,7 @@ private const val CUSTOM_BROWSER_SPOOF = """
             if (el.style.display !== 'none') {
                 var text = el.textContent || '';
                 if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 2000) {
-                    el.style.display = 'none'; // Ocultar visualmente, NO borrar
+                    el.style.display = 'none';
                 }
             }
         });
@@ -113,7 +110,6 @@ private const val CUSTOM_BROWSER_SPOOF = """
     observer.observe(document.documentElement, { childList: true, subtree: true });
     setTimeout(hideModals, 100);
 
-    // 4. Falsificar Google Ads
     window.googletag = window.googletag || {};
     window.googletag.apiReady = true;
     window.googletag.cmd = window.googletag.cmd || { push: function(f) { try { f(); } catch(e){} } };
@@ -140,12 +136,10 @@ private const val CUSTOM_READER_BYPASS = """
     if (window.__readerBypassActive) return;
     window.__readerBypassActive = true;
 
-    // 1. Ocultar carteles y anuncios
     var style = document.createElement('style');
     style.innerHTML = '.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield, .lector-block, #adblock-block-modal, #brave-block-modal, #devtools-block-modal { display: none !important; }';
     if (document.head) document.head.appendChild(style);
 
-    // 2. Prevenir borrado de canvas (Solo aquí, en el lector, es seguro)
     const originalRemove = Element.prototype.remove;
     Element.prototype.remove = function() {
         if (this.className === 'reading-content' || (this.classList && (this.classList.contains('manga-canvas-wrapper') || this.classList.contains('manga-page-canvas')))) {
@@ -154,7 +148,6 @@ private const val CUSTOM_READER_BYPASS = """
         originalRemove.call(this);
     };
 
-    // 3. MutationObserver para quitar clases de bloqueo
     var observer = new MutationObserver(function(mutations) {
         for (var i = 0; i < mutations.length; i++) {
             if (mutations[i].type === 'attributes' && mutations[i].attributeName === 'class') {
@@ -167,33 +160,6 @@ private const val CUSTOM_READER_BYPASS = """
     });
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
     observer.observe(document.body, { attributes: true, attributeFilter: ['class'] });
-})();
-"""
-
-// SCRIPT 2: SOLO PARA EL LECTOR (Quita carteles y evita que borren el manga)
-private const val CUSTOM_READER_BYPASS = """
-(function() {
-    if (window.__readerBypassActive) return;
-    window.__readerBypassActive = true;
-
-    // 1. EVITAMOS QUE BORREN LA PANTALLA (Solo en el lector)
-    const originalRemove = Element.prototype.remove;
-    Element.prototype.remove = function() {
-        if (this.className === 'reading-content' || (this.classList && (this.classList.contains('manga-canvas-wrapper') || this.classList.contains('manga-page-canvas')))) {
-            return; // Bloquea el borrado
-        }
-        originalRemove.call(this);
-    };
-
-    // 2. Ocultar carteles y anuncios visualmente
-    setInterval(function() {
-        try {
-            document.documentElement.classList.remove('adblock-blocked', 'brave-blocked', 'is-lector');
-            document.querySelectorAll('.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield, .lector-block, #adblock-block-modal, #brave-block-modal, #devtools-block-modal').forEach(function(a) {
-                if(a) a.style.display = 'none';
-            });
-        } catch(e) {}
-    }, 1000);
 })();
 """
 
@@ -351,9 +317,13 @@ fun WebViewScreenContent(
     val webClient = remember(refreshTick) {
         object : AccompanistWebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val host = request.url.host
+                if (host == "blayvia.com" || host?.endsWith(".blayvia.com") == true || host == "aedexnox.com") {
+                    return super.shouldInterceptRequest(view, request)
+                }
+
                 return try {
                     if (levelFor(view.url) == RelaxLevel.OFF) return super.shouldInterceptRequest(view, request)
-                    val host = request.url.host
                     val isBlocked = host != null && (SAFE_AD_HOSTS.any { host == it || host.endsWith(".$it") } || AdBlockHostList.isBlocked(host))
                     if (isBlocked) {
                         WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
@@ -374,10 +344,7 @@ fun WebViewScreenContent(
                 AdBlockHostList.ensureLoaded(view.context.applicationContext)
                 committed = false
 
-                // 1. SIEMPRE inyectamos el espía de navegador (para que el login y Cloudflare pasen)
                 view.evaluateJavascript(CUSTOM_BROWSER_SPOOF, null)
-
-                // 2. Solo inyectamos el bloqueador agresivo si estamos en el lector (blayvia o /comic/)
                 if (url?.contains("blayvia.com") == true || (url?.contains("/comic/") == true && !url.contains("/auth/"))) {
                     view.evaluateJavascript(CUSTOM_READER_BYPASS, null)
                 }
@@ -402,12 +369,6 @@ fun WebViewScreenContent(
                 super.onPageFinished(view, url)
                 if (!committed) committed = true
                 relaxJob?.cancel()
-
-                // Volver a inyectar por si acaso
-                view.evaluateJavascript(CUSTOM_BROWSER_SPOOF, null)
-                if (url?.contains("blayvia.com") == true || (url?.contains("/comic/") == true && !url.contains("/auth/"))) {
-                    view.evaluateJavascript(CUSTOM_READER_BYPASS, null)
-                }
 
                 scope.launch {
                     val html = view.getHtml()
@@ -593,7 +554,6 @@ fun WebViewScreenContent(
                 onCreated = { webView ->
                     webView.setDefaultSettings()
 
-                    // MAGIA PARA EL LOGIN: Cookies y almacenamiento DOM activados
                     val cookieManager = CookieManager.getInstance()
                     cookieManager.setAcceptCookie(true)
                     cookieManager.setAcceptThirdPartyCookies(webView, true)
@@ -604,7 +564,6 @@ fun WebViewScreenContent(
                         WebView.setWebContentsDebuggingEnabled(true)
                     }
 
-                    // User-Agent de Chrome para burlar la detección de WebView
                     webView.setUserAgent("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
                     AdBlockHostList.ensureLoaded(webView.context.applicationContext)
