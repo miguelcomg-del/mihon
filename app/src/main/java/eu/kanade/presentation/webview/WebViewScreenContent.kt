@@ -87,24 +87,42 @@ private const val CUSTOM_BROWSER_SPOOF = """
     try {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
-        Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         if (!window.chrome) { window.chrome = { runtime: {} }; }
     } catch (e) {}
 
-    // 2. Falsificamos Google Ads (para que Cloudflare pase)
+    // 2. Inyectar CSS para ocultar los carteles de "Abre en tu navegador" (SEGURO PARA REACT)
+    var style = document.createElement('style');
+    style.innerHTML = '.lector-block, #devtools-block-modal, #adblock-block-modal, #brave-block-modal { display: none !important; }';
+    if (document.head) document.head.appendChild(style);
+
+    // 3. Ocultar cualquier otro cartel dinámico usando MutationObserver (sin romper React)
+    function hideModals() {
+        var phrases = ['Abre Aedex en tu navegador', 'Abrir en el navegador', 'Copiar enlace'];
+        var divs = document.querySelectorAll('div, section, [role="dialog"]');
+        divs.forEach(function(el) {
+            if (el.style.display !== 'none') {
+                var text = el.textContent || '';
+                if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 2000) {
+                    el.style.display = 'none'; // Ocultar visualmente, NO borrar
+                }
+            }
+        });
+    }
+    var observer = new MutationObserver(hideModals);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(hideModals, 100);
+
+    // 4. Falsificar Google Ads
     window.googletag = window.googletag || {};
     window.googletag.apiReady = true;
     window.googletag.cmd = window.googletag.cmd || { push: function(f) { try { f(); } catch(e){} } };
-    window.googletag.pubads = window.googletag.pubads || function() {
-        return { addEventListener: function() {}, enableLazyLoad: function() {}, collapseEmptyDivs: function() {}, addService: function() {} };
-    };
+    window.googletag.pubads = window.googletag.pubads || function() { return { addEventListener: function() {}, enableLazyLoad: function() {}, collapseEmptyDivs: function() {}, addService: function() {} }; };
     window.googletag.defineSlot = window.googletag.defineSlot || function() { return { addService: function() {} }; };
     window.googletag.defineOutOfPageSlot = window.googletag.defineOutOfPageSlot || function() { return { addService: function() {} }; };
     window.googletag.enableServices = window.googletag.enableServices || function() {};
     window.googletag.display = window.googletag.display || function() {};
 
-    // 3. Interceptamos el fetch de anuncios
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
         const url = args[0];
@@ -113,6 +131,42 @@ private const val CUSTOM_BROWSER_SPOOF = """
         }
         return originalFetch.apply(this, args);
     };
+})();
+"""
+
+// SCRIPT 2: LECTOR (Bloquea borrado, CSS y MutationObserver para el manga)
+private const val CUSTOM_READER_BYPASS = """
+(function() {
+    if (window.__readerBypassActive) return;
+    window.__readerBypassActive = true;
+
+    // 1. Ocultar carteles y anuncios
+    var style = document.createElement('style');
+    style.innerHTML = '.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield, .lector-block, #adblock-block-modal, #brave-block-modal, #devtools-block-modal { display: none !important; }';
+    if (document.head) document.head.appendChild(style);
+
+    // 2. Prevenir borrado de canvas (Solo aquí, en el lector, es seguro)
+    const originalRemove = Element.prototype.remove;
+    Element.prototype.remove = function() {
+        if (this.className === 'reading-content' || (this.classList && (this.classList.contains('manga-canvas-wrapper') || this.classList.contains('manga-page-canvas')))) {
+            return; 
+        }
+        originalRemove.call(this);
+    };
+
+    // 3. MutationObserver para quitar clases de bloqueo
+    var observer = new MutationObserver(function(mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+            if (mutations[i].type === 'attributes' && mutations[i].attributeName === 'class') {
+                var el = mutations[i].target;
+                if (el === document.documentElement || el === document.body) {
+                    el.classList.remove('adblock-blocked', 'brave-blocked', 'is-lector');
+                }
+            }
+        }
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    observer.observe(document.body, { attributes: true, attributeFilter: ['class'] });
 })();
 """
 
