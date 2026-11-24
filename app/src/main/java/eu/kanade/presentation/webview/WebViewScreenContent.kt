@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Message
+import android.webkit.CookieManager
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
@@ -77,83 +78,64 @@ import tachiyomi.presentation.core.i18n.stringResource
 private const val RELAX_TIMEOUT_MS = 7_000L
 private const val MAX_RELOADS_PER_SITE = 2
 
-// Enums que faltaban en tu código
 enum class RelaxLevel { FULL, NETWORK_ONLY, OFF }
 
-// Bypass definitivo para Aedex/Blayvia: Anti-Bloqueo, Anti-Click y Falso AdBlock
-private const val CUSTOM_AEDEX_SWEEPER = """
+// SCRIPT 1: SOLO PARA EL LOGIN (Falsifica navegador y anuncios, NO toca el DOM)
+private const val CUSTOM_BROWSER_SPOOF = """
 (function() {
-    // 1. Anti-Detección (Falsificamos el navegador)
+    // 1. Anti-Detección
     try {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
         Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         if (!window.chrome) { window.chrome = { runtime: {} }; }
     } catch (e) {}
 
-    // 2. Falsificamos Google Tag Manager (para que crean que los anuncios cargaron)
+    // 2. Falsificamos Google Ads (para que Cloudflare pase)
     window.googletag = window.googletag || {};
     window.googletag.apiReady = true;
     window.googletag.cmd = window.googletag.cmd || { push: function(f) { try { f(); } catch(e){} } };
     window.googletag.pubads = window.googletag.pubads || function() {
-        return {
-            addEventListener: function() {},
-            enableLazyLoad: function() {},
-            collapseEmptyDivs: function() {},
-            addService: function() {}
-        };
+        return { addEventListener: function() {}, enableLazyLoad: function() {}, collapseEmptyDivs: function() {}, addService: function() {} };
     };
     window.googletag.defineSlot = window.googletag.defineSlot || function() { return { addService: function() {} }; };
     window.googletag.defineOutOfPageSlot = window.googletag.defineOutOfPageSlot || function() { return { addService: function() {} }; };
     window.googletag.enableServices = window.googletag.enableServices || function() {};
     window.googletag.display = window.googletag.display || function() {};
 
-    // 3. Interceptamos el fetch de anuncios para que no falle
+    // 3. Interceptamos el fetch de anuncios
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
         const url = args[0];
-        if (typeof url === 'string' && url.includes('securepubads.g.doubleclick.net')) {
+        if (typeof url === 'string' && (url.includes('securepubads') || url.includes('pagead2') || url.includes('doubleclick'))) {
             return new Response('', { status: 200 });
         }
         return originalFetch.apply(this, args);
     };
+})();
+"""
 
-    // 4. EVITAMOS QUE BORREN LA PANTALLA
+// SCRIPT 2: SOLO PARA EL LECTOR (Quita carteles y evita que borren el manga)
+private const val CUSTOM_READER_BYPASS = """
+(function() {
+    if (window.__readerBypassActive) return;
+    window.__readerBypassActive = true;
+
+    // 1. EVITAMOS QUE BORREN LA PANTALLA (Solo en el lector)
     const originalRemove = Element.prototype.remove;
     Element.prototype.remove = function() {
-        if (this.className === 'reading-content' || (this.classList && this.classList.contains('manga-canvas-wrapper'))) {
-            console.log("Bloqueado intento de borrar el contenido");
-            return; // No dejamos que borren el manga
+        if (this.className === 'reading-content' || (this.classList && (this.classList.contains('manga-canvas-wrapper') || this.classList.contains('manga-page-canvas')))) {
+            return; // Bloquea el borrado
         }
         originalRemove.call(this);
     };
 
-    // 5. Hacemos que el detector de AdBlock crea que los anuncios están visibles
-    const originalAppendChild = Node.prototype.appendChild;
-    Node.prototype.appendChild = function(child) {
-        if (child.className && typeof child.className === 'string' && child.className.includes('adsbox')) {
-            Object.defineProperty(child, 'offsetHeight', { get: () => 250 });
-            Object.defineProperty(child, 'offsetWidth', { get: () => 300 });
-        }
-        return originalAppendChild.call(this, child);
-    };
-
-    // 6. Limpiamos los carteles de error y anuncios flotantes
+    // 2. Ocultar carteles y anuncios visualmente
     setInterval(function() {
         try {
             document.documentElement.classList.remove('adblock-blocked', 'brave-blocked', 'is-lector');
-            var phrases = ['Abre Aedex en tu navegador', 'Bloqueador de anuncios detectado', 'Contenido Protegido', 'Navegador no compatible'];
-            var divs = document.querySelectorAll('div, section');
-            divs.forEach(function(el) {
-                if (el.style.display !== 'none' && el.id !== 'manga-page-canvas') {
-                    var text = el.textContent || '';
-                    if (phrases.some(function(p) { return text.indexOf(p) !== -1; }) && text.length < 3000) {
-                        el.style.display = 'none';
-                    }
-                }
-            });
-            // Ocultar anuncios visualmente
-            document.querySelectorAll('.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield').forEach(function(a) {
+            document.querySelectorAll('.ad, .ad-gpt, #ad-container, .lector-float-ad, .manga-canvas-shield, .lector-block, #adblock-block-modal, #brave-block-modal, #devtools-block-modal').forEach(function(a) {
                 if(a) a.style.display = 'none';
             });
         } catch(e) {}
@@ -161,7 +143,6 @@ private const val CUSTOM_AEDEX_SWEEPER = """
 })();
 """
 
-// Bloqueador de anuncios (Rescatado de tu primera versión)
 private object AdBlockHostList {
     @Volatile private var hosts: Set<String>? = null
     @Volatile private var loading = false
@@ -339,8 +320,13 @@ fun WebViewScreenContent(
                 AdBlockHostList.ensureLoaded(view.context.applicationContext)
                 committed = false
 
-                // Inyectar el destructor de carteles
-                view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
+                // 1. SIEMPRE inyectamos el espía de navegador (para que el login y Cloudflare pasen)
+                view.evaluateJavascript(CUSTOM_BROWSER_SPOOF, null)
+
+                // 2. Solo inyectamos el bloqueador agresivo si estamos en el lector (blayvia o /comic/)
+                if (url?.contains("blayvia.com") == true || (url?.contains("/comic/") == true && !url.contains("/auth/"))) {
+                    view.evaluateJavascript(CUSTOM_READER_BYPASS, null)
+                }
 
                 relaxJob?.cancel()
                 if (levelFor(url ?: currentUrl) != RelaxLevel.OFF) {
@@ -364,7 +350,10 @@ fun WebViewScreenContent(
                 relaxJob?.cancel()
 
                 // Volver a inyectar por si acaso
-                view.evaluateJavascript(CUSTOM_AEDEX_SWEEPER, null)
+                view.evaluateJavascript(CUSTOM_BROWSER_SPOOF, null)
+                if (url?.contains("blayvia.com") == true || (url?.contains("/comic/") == true && !url.contains("/auth/"))) {
+                    view.evaluateJavascript(CUSTOM_READER_BYPASS, null)
+                }
 
                 scope.launch {
                     val html = view.getHtml()
@@ -550,11 +539,18 @@ fun WebViewScreenContent(
                 onCreated = { webView ->
                     webView.setDefaultSettings()
 
+                    // MAGIA PARA EL LOGIN: Cookies y almacenamiento DOM activados
+                    val cookieManager = CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    cookieManager.setAcceptThirdPartyCookies(webView, true)
+                    webView.settings.domStorageEnabled = true
+                    webView.settings.databaseEnabled = true
+
                     if (BuildConfig.DEBUG && 0 != webView.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) {
                         WebView.setWebContentsDebuggingEnabled(true)
                     }
 
-                    // MAGIA: User-Agent de Chrome para burlar la detección de WebView
+                    // User-Agent de Chrome para burlar la detección de WebView
                     webView.setUserAgent("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
                     AdBlockHostList.ensureLoaded(webView.context.applicationContext)
@@ -563,7 +559,7 @@ fun WebViewScreenContent(
                         val handler = runCatching {
                             WebViewCompat.addDocumentStartJavaScript(
                                 webView,
-                                CUSTOM_AEDEX_SWEEPER,
+                                CUSTOM_BROWSER_SPOOF,
                                 setOf("*"),
                             )
                         }.getOrNull()
